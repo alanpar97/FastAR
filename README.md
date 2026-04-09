@@ -8,7 +8,7 @@ root
 ├── baselines
 ```
 
-The [fastar](fastar) directory contains the FastAR code and the [baselines](baselines) directory contains the code for all the baselines. 
+The [fastar](src/fastar) directory contains the FastAR code and the [baselines](baselines) directory contains the code for all the baselines. 
 
 ## FastAR
 
@@ -20,7 +20,7 @@ The [fastar](fastar) directory contains the FastAR code and the [baselines](base
 
 ### Training and evaluating the agents. 
 
-Commands for training and evaluating the agents for the three datasets) with specific hyper-parameters can be found [here](fastar/commands_to_run.md). For convenience, we provide the trained agents for the three datasets [here](fastar/output/trained_models/). The evaluation commands will load the trained agents and run them. 
+Commands for training and evaluating the agents for the three datasets) with specific hyper-parameters can be found [here](src/fastar/commands_to_run.md). For convenience, we provide the trained agents for the three datasets [here](src/fastar/output/trained_models/). The evaluation commands will load the trained agents and run them. 
 The expected directory structure is: 
 
 ```tree
@@ -32,7 +32,7 @@ fastar
 
 ### FastAR results
 
-After running the evaluation command, the results will be printed in CSV format in [this](fastar/output/results) directory. 
+After running the evaluation command, the results will be printed in CSV format in [this](src/fastar/output/results) directory. 
 
 
 ## Baselines
