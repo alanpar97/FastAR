@@ -1,114 +1,195 @@
-# Replication code for FastAR submission.
+# FastAR
 
-The directory structure is as follows:
+Amortized generation of sequential algorithmic recourses for black-box models.
 
-```tree
-root
-├── fastar
-├── baselines
-```
+FastAR trains a PPO agent to edit an input instance — one feature at a time — until a black-box classifier flips its prediction to a desired class. The agent learns a general recourse policy from training data, so at inference time it can produce counterfactual explanations for new instances without re-optimization.
 
-The [fastar](src/fastar) directory contains the FastAR code and the [baselines](baselines) directory contains the code for all the baselines. 
+This package is a clean refactor of the [original research code](https://github.com/vsahil/FastAR-RL-for-generating-AR) into a reusable Python library. The experiment harness, baselines, and dataset-specific scaffolding have been removed; what remains is the core method behind a simple `fit` / `explain` API.
 
-## FastAR
-
-### Setup Instructions
-
-1. Create a virtual environment by running: `virtualenv -p python3.6 supplementary`. 
-2. Activate the virtual environment by running: `source supplementary/bin/activate`. 
-3. Install the requirements by running the command `bash install_requirements.sh`. This install the requirements and the gym environments. 
-
-### Training and evaluating the agents. 
-
-Commands for training and evaluating the agents for the three datasets) with specific hyper-parameters can be found [here](src/fastar/commands_to_run.md). For convenience, we provide the trained agents for the three datasets [here](src/fastar/output/trained_models/). The evaluation commands will load the trained agents and run them. 
-The expected directory structure is: 
-
-```tree
-fastar
-├── output
-│   ├── trained_models
-│   ├── results
-```
-
-### FastAR results
-
-After running the evaluation command, the results will be printed in CSV format in [this](src/fastar/output/results) directory. 
-
-
-## Baselines
-
-### Random and Greedy baselines
-
-For running the random and greedy baselines, 
-```bash
-cd baselines
-python random_strategy.py $dataset
-python greedy_strategy.py $dataset
-```
-
-The options for the dataset are "german", "adult" and "default", which correspond to the German Credit, Adult Income, and Credit Default datasets respectively. 
-The computed metrics are saved in file [all_metrics_baselines.csv](baselines/results/all_metrics_baselines.csv). 
-
-### DiCE-Random, DiCE-Genetic, and DiCE-KDTree baselines
-All the supporting code for DiCE-based baselines is in the [dice_ml](baselines/dice_ml) directory. 
-For the model-agnostic versions of DiCE specifically, we provide the code in the file [dice_model_agnostic](baselines/dice_model_agnostic.py). 
-For running the approaches, use this command:
+## Installation
 
 ```bash
-python dice_model_agnostic.py $dataset $model_agnostic_approach
+git clone https://github.com/alanpar97/FastAR.git
+cd FastAR
+
+uv venv
+uv pip install -e .
+
+# If you want to run the examples (requires pandas):
+uv pip install -e ".[examples]"
 ```
-where $dataset is one of "german", "adult" or "default", and model-agnostic approaches are "random", "genetic", and "kdtree". 
-Similar to the last case, the computed metrics are saved in file [all_metrics_baselines.csv](baselines/results/all_metrics_baselines.csv). 
 
+## Quick start
 
-### DiCE-Gradient 
-For DiCE-Gradient, we provide the code in the file [dice_gradient.py](baselines/dice_gradient.py). For running this approach, use this command:
+```python
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from fastar import FastAR, FeatureSpec
+
+# 1. Train any classifier with predict_proba
+X = np.random.default_rng(0).normal(size=(200, 3)).astype(np.float32)
+X = np.clip(X / X.max(axis=0), -1, 1)  # scale to [-1, 1]
+y = (X[:, 0] + X[:, 1] > 0).astype(int)
+classifier = LogisticRegression().fit(X, y)
+
+# 2. Describe your features
+spec = FeatureSpec(
+    columns=("income", "age", "score"),
+    continuous=("income", "age", "score"),
+    immutable=("age",),               # age cannot be changed
+    monotonic_increasing=("score",),   # score can only go up
+)
+
+# 3. Fit and explain
+fastar = FastAR(classifier, spec, dist_lambda=0.1, seed=42)
+fastar.fit(X, total_timesteps=50_000)
+
+x = X[classifier.predict(X) == 0][0]  # pick an undesirable instance
+result = fastar.explain(x)
+
+print(f"success: {result.success}")
+print(f"steps:   {result.num_steps}")
+print(f"before:  {result.original}")
+print(f"after:   {result.counterfactual}")
+```
+
+## Usage guide
+
+### Bring your own model and data
+
+FastAR works with **any classifier** that exposes a scikit-learn-style `predict_proba(X)` method. It does not train a classifier for you — you bring one that is already fitted.
+
+**Data must be scaled to `[-1, 1]`** before passing it to FastAR. The library does not scale internally so that it stays independent of your preprocessing pipeline. A typical setup:
+
+```python
+from sklearn.preprocessing import MinMaxScaler
+
+scaler = MinMaxScaler(feature_range=(-1, 1)).fit(X_train)
+X_train_scaled = scaler.transform(X_train).astype(np.float32)
+
+# Train your classifier on the scaled data
+classifier.fit(X_train_scaled, y_train)
+```
+
+### Defining a FeatureSpec
+
+`FeatureSpec` encodes domain knowledge about your dataset. This is how you tell FastAR which features can change, which cannot, and how features relate to each other.
+
+```python
+from fastar import FeatureSpec
+
+spec = FeatureSpec(
+    columns=("age", "education", "income", "sex", "hours_per_week"),
+    continuous=("age", "income", "hours_per_week"),  # numerical features
+    immutable=("sex",),                               # cannot be changed
+    monotonic_increasing=("age", "education"),         # can only increase
+    correlated=(
+        # increasing education causes age to increase by 0.054 in scaled space
+        ("education", "age", 0.054),
+    ),
+    step_size=0.05,  # magnitude of each action in [-1, 1] space
+)
+```
+
+Columns not listed in `continuous` are treated as categorical. The agent still edits them by the same step size — the distinction is for your own bookkeeping.
+
+### Training
+
+```python
+fastar = FastAR(
+    classifier=classifier,
+    feature_spec=spec,
+    dist_lambda=0.1,        # manifold-distance penalty coefficient
+    max_episode_steps=50,   # max actions per episode
+    seed=0,
+)
+
+fastar.fit(
+    X_train_scaled,
+    total_timesteps=500_000,  # more steps = better policy
+)
+```
+
+Under the hood, `fit` creates a Gymnasium environment and trains a [Stable-Baselines3](https://stable-baselines3.readthedocs.io/) PPO agent. You can pass extra arguments to the PPO constructor or the `.learn()` call:
+
+```python
+fastar.fit(
+    X_train_scaled,
+    total_timesteps=1_000_000,
+    ppo_kwargs={"verbose": 1, "n_steps": 256},
+    learn_kwargs={"log_interval": 50},
+)
+```
+
+### Explaining instances
+
+```python
+# Single instance
+explanation = fastar.explain(x_scaled)
+
+print(explanation.success)          # did the classifier flip?
+print(explanation.num_steps)        # how many actions were taken
+print(explanation.original)         # starting point
+print(explanation.counterfactual)   # final point
+print(explanation.trajectory)       # (num_steps+1, n_features) array
+```
+
+```python
+# Batch
+explanations = fastar.explain_batch(X_test_scaled)
+validity = sum(e.success for e in explanations) / len(explanations)
+```
+
+### Saving and loading policies
+
+```python
+# Save after training
+fastar.save("my_policy")
+
+# Load into a new FastAR instance (same classifier and spec required)
+fastar2 = FastAR(classifier, spec, dist_lambda=0.1)
+fastar2.load_policy("my_policy.zip", X_train_scaled)
+explanation = fastar2.explain(x)
+```
+
+## Examples
+
+Full runnable examples are in the [`examples/`](examples/) directory:
+
+- **[`quickstart.py`](examples/quickstart.py)** — Minimal 2D synthetic dataset. Runs in seconds.
+- **[`german_credit.py`](examples/german_credit.py)** — End-to-end pipeline on the German Credit dataset: loading data, training an MLP, defining feature constraints, fitting FastAR, and printing the counterfactual.
 
 ```bash
-python dice_gradient.py $dataset 
-```
-where $dataset is one of "german", "adult" or "default". Similar to the last case, the computed metrics are saved in file [all_metrics_baselines.csv](baselines/results/all_metrics_baselines.csv). 
-
-### DiCE-VAE
-
-Unlike other DiCE baselines, DiCE-VAE takes several hyper-parameters. We ran a hyperparamter exploration (using the file [hyperparam_dicevae.py](baselines/hyperparam_dicevae.py) ) and found the best working ones. For using DiCE-VAE, use this command:
-
-1. For the German Credit dataset, use this command:
-```bash
-python dice_vae.py --dataset_name=german --epochs=25 --batch_size=64 --encoded_size=10 --lr=0.01 --validity_reg=40
-```
-2. For the Adult Income dataset, use this command:
-```bash
-python dice_vae.py --dataset_name=adult --epochs=25 --batch_size=1024 --encoded_size=50 --lr=0.001 --validity_reg=80
-```
-3. For the Credit Default dataset, use this command:
-```bash
-python dice_vae.py --dataset_name=default --epochs=25 --batch_size=2048 --encoded_size=30 --lr=0.05 --validity_reg=60
+python examples/quickstart.py
+python examples/german_credit.py
 ```
 
-Similar to the last case, the computed metrics are saved in file [all_metrics_baselines.csv](baselines/results/all_metrics_baselines.csv). 
+## Project structure
 
-### MACE
-
-For using the MACE tool, change directory into the [mace-master](baselines/mace-master) directory and run the following command. 
-
-```bash
-python batchTest.py -d german_our -m forest -n one_norm -a MACE_eps_1e-3 -b 0 -s 500
-python batchTest.py -d german_our -m lr -n one_norm -a MACE_eps_1e-3 -b 0 -s 500
 ```
-Recall that we ran MACE only for the German Credit dataset, and with logisic regression (LR) 
-and random forest (RF) as the classifiers. 
-
-The computed explanations from MACE are saved in the following directories:
-1. [LR](baselines/mace-master/_experiments/2021.05.25_13.44.19__german_our__lr__one_norm__MACE_eps_1e-3__batch0__samples500__pid0)
-2. [RF](baselines/mace-master/_experiments/2021.05.25_13.45.10__german_our__forest__one_norm__MACE_eps_1e-3__batch0__samples500__pid0)
-
-The file [process_results.py](baselines/mace-master/process_results.py) was used to parse the results from MACE and calculate the evaluation metrics.
-For parsing the results, use this command:
-```bash
-python process_MACE_results.py LR
-python process_MACE_results.py RF
+FastAR/
+├── src/fastar/
+│   ├── __init__.py        # public exports: FastAR, FeatureSpec, CounterfactualEnv, Explanation
+│   ├── agent.py           # FastAR class (fit / explain / save / load)
+│   ├── env.py             # CounterfactualEnv (Gymnasium environment)
+│   └── feature_spec.py    # FeatureSpec dataclass
+├── tests/
+├── examples/
+└── pyproject.toml
 ```
 
-The metrics are saved in the usual file [all_metrics_baselines.csv](baselines/results/all_metrics_baselines.csv). 
+## Citation
 
+If you use FastAR in your work, please cite the original paper:
+
+```bibtex
+@inproceedings{verma2022amortized,
+  title={Amortized generation of sequential algorithmic recourses for black-box models},
+  author={Verma, Sahil and Hines, Keegan and Dickerson, John P},
+  booktitle={Proceedings of the AAAI Conference on Artificial Intelligence},
+  volume={36},
+  number={8},
+  pages={8512--8519},
+  year={2022}
+}
+```
